@@ -98,12 +98,6 @@ python scripts/run_embedding.py --input-file "path/to/texts.json" --model-path "
 - If the dataset is too large to fit in memory, you might need to load and handle the data manually from the `embeddings.json` file.
 - The embedding process is computationally intensive and will attempt to utilize all available GPU space.
 
-```
-
-### Summary of Changes
-
-- **`run_embedding.py`**: Updated to handle input from files in `.txt`, `.json`, and `.csv` formats.
-- **Documentation**: Added a new section detailing the file input options, usage examples, and command-line options.
 
 ## Conclusion
 
