@@ -519,16 +519,21 @@ class EmbeddingGenerator:
             for text, content in parser:
                 # Convert Decimal types to floats
                 content = convert_decimal(content)
-                if content['average_embedding']:
-                    content = {
-                        'average_embedding': content['average_embedding']
-                    }
+
+                # Handle finished entries that only have the average_embedding
+                if content.get('average_embedding') and len(content) == 1:
+                    # This entry is considered complete
+                    keys_to_remove.add(text)
+
                 if text in self.changed_keys:
                     new_content = self.texts[text]
 
-                    # Check if all 'finished' values are True
-                    if 'finished' in new_content and all(new_content['finished']) and len(content['finished']) > 0:
+                    # Update content if changes are detected
+                    if 'finished' in new_content and all(new_content['finished']) and len(new_content['finished']) > 0:
                         keys_to_remove.add(text)
+                        new_content = {
+                            'average_embedding': new_content['average_embedding']
+                        }
 
                     content = new_content
                     self.changed_keys.remove(text)
