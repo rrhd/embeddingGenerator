@@ -1,82 +1,113 @@
+"""A class to estimate the token limit for embedding batches based on past successes and failures."""
+
+import torch
 
 
 class TokenLimitEstimator:
-    def __init__(self, initial_limit: int = 1000, learning_rate: float = 0.1, max_limit: int = 250000,
-                 min_limit: int = 1000) -> None:
-        """
-        Initializes the TokenLimitEstimator to dynamically adjust the maximum token limit for embedding
-        batches based on success and failure rates.
+    """A class to estimate the token limit for embedding batches based on past successes and failures.
+
+    The TokenLimitEstimator adjusts the maximum token limit for embedding batches based on the outcomes
+    of past batches. It uses an Exponential Moving Average (EMA) to smooth the adjustments and adapt
+    to changing conditions over time.
+
+    Attributes:
+        max_gpu_memory: The maximum available GPU memory in MB.
+        current_limit: The current token limit for embedding batches.
+        min_limit: The minimum allowable token limit.
+        ema_alpha: The alpha value for the EMA calculation.
+        ema_limit: The EMA of the token limit.
+        last_outcome: The outcome of the last batch (True for success, False for OOM).
+        streak: The number of consecutive successes or failures.
+    """
+
+    def __init__(self, initial_limit: int | None = None, min_limit: int = 1000) -> None:
+        """Initializes the TokenLimitEstimator to adaptively adjust the maximum token limit for embedding batches based on past successes and failures.
 
         Args:
-            initial_limit: The starting token limit for embedding batches. Defaults to 1000.
-            learning_rate: The rate at which the token limit is adjusted after successes or failures.
-                           Defaults to 0.1.
-            max_limit: The maximum allowable token limit for embedding batches. Defaults to 250000.
-            min_limit: The minimum allowable token limit for embedding batches. Defaults to 1000.
-
+            initial_limit: Optional initial token limit. If None, it starts with an estimate
+                           based on GPU memory or an initial test batch.
+            min_limit: Minimum allowable token limit. Defaults to 1000.
         """
-        self.current_limit = initial_limit
-        self.learning_rate = learning_rate
-        self.max_limit = max_limit
+        self.max_gpu_memory = self.get_max_gpu_memory()  # In MB
+        self.current_limit = initial_limit or self.estimate_initial_limit()
         self.min_limit = min_limit
-        self.success_streak = 0
-        self.failure_streak = 0
-        self.convergence_threshold = 100  # Number of consecutive successes to consider converged
-
+        self.ema_alpha = 0.9  # Higher value for smoother EMA
+        self.ema_limit = self.current_limit
+        self.last_outcome = None
+        self.streak = 0
 
     def __call__(self) -> int:
-        """
-        Returns the current token limit for embedding batches.
+        """Returns the current token limit for embedding batches, based on the EMA.
 
         Returns:
             The current token limit as an integer.
         """
-        return self.current_limit
+        return int(max(self.ema_limit, self.min_limit))
 
     def update(self, success: bool, tokens: int) -> None:
-        """
-        Updates the current token limit based on the success or failure of the last embedding attempt.
+        """Updates the token limit estimator based on the outcome of the last batch.
 
         Args:
-            success: A boolean indicating whether the last embedding attempt was successful (True) or failed due to OOM (False).
-            tokens: The number of tokens used in the last embedding attempt.
-
-        Updates:
-            Adjusts the `current_limit` based on the outcome. If successful, the limit may increase gradually
-            until the convergence threshold is reached. If failed, the limit decreases more aggressively
-            depending on the number of consecutive failures.
+            success: True if the last batch was successful, False if it caused an OOM.
+            tokens: The number of tokens in the last batch.
         """
-        if success:
-            self.success_streak += 1
-            self.failure_streak = 0
-
-            if self.success_streak < self.convergence_threshold:
-                new_limit = max(self.current_limit + self.learning_rate * (self.max_limit - tokens), self.current_limit)
-                if new_limit > self.current_limit:
-                    self.current_limit = new_limit
+        if self.last_outcome == success:
+            self.streak += 1
         else:
-            self.success_streak = 0
-            self.failure_streak += 1
+            self.streak = 1
+        self.last_outcome = success
 
-            decrease_factor = 0.9 ** self.failure_streak
-            self.current_limit *= decrease_factor
+        if success:
+            # On success, try increasing the limit slightly
+            increment = tokens * 0.05
+            new_limit = tokens + increment
+            self.ema_limit = self.ema_alpha * self.ema_limit + (1 - self.ema_alpha) * new_limit
+        else:
+            # On failure, reduce the limit significantly
+            reduction = tokens * 0.5
+            new_limit = max(tokens - reduction, self.min_limit)
+            self.ema_limit = self.ema_alpha * self.ema_limit + (1 - self.ema_alpha) * new_limit
+            # Clear CUDA cache to free up memory
+            torch.cuda.empty_cache()
 
-        self.current_limit = int(max(min(self.current_limit, self.max_limit), self.min_limit))
+    def estimate_initial_limit(self) -> int:
+        """Estimates the initial token limit based on the available GPU memory.
+
+        Returns:
+            Estimated initial token limit.
+        """
+        # Estimate based on GPU memory (assuming 1 token ~ 2KB in GPU memory)
+        # This may need to be adjusted based on the actual model and hardware
+        estimated_tokens = (
+            self.max_gpu_memory * 1024
+        ) / 2  # Convert MB to KB, divide by 2KB per token
+        return int(max(min(estimated_tokens, 1_000_000), self.min_limit))
+
+    def get_max_gpu_memory(self) -> int:
+        """Retrieves the maximum available GPU memory in MB.
+
+        Returns:
+            Total GPU memory in MB.
+        """
+        if torch.cuda.is_available():
+            gpu_properties = torch.cuda.get_device_properties(0)
+            total_memory = gpu_properties.total_memory / (1024 * 1024)  # Convert bytes to MB
+            return total_memory
+        else:
+            return 4000  # Default to 4GB if no GPU is available
 
     def add_success(self, tokens: int) -> None:
-        """
-        Updates the token limit after a successful embedding attempt.
+        """Updates the token limit after a successful batch.
 
         Args:
-            tokens: The number of tokens used in the successful embedding attempt.
+            tokens: The number of tokens in the successful batch.
         """
         self.update(True, tokens)
 
     def add_fail(self, tokens: int) -> None:
-        """
-        Updates the token limit after a failed embedding attempt due to an out-of-memory (OOM) error.
+        """Updates the token limit after a failed batch due to OOM.
 
         Args:
-            tokens: The number of tokens used in the failed embedding attempt.
+            tokens: The number of tokens in the failed batch.
         """
         self.update(False, tokens)

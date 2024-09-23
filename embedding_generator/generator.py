@@ -1,7 +1,14 @@
-import shutil
+"""A module for generating embeddings for a batch of texts using a SentenceTransformer model.
+
+The EmbeddingGenerator processes texts in batches to manage memory usage efficiently.
+It chunks texts into manageable sizes based on token limits and processes them in parallel.
+The embeddings are saved to disk along with the average embeddings for each text.
+"""
+
+import hashlib
+from collections.abc import Iterator
 from pathlib import Path
 
-import ijson
 import numpy as np
 import torch
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -9,625 +16,506 @@ from orjson import orjson
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
-from embedding_generator.limit_estimator import TokenLimitEstimator
-from embedding_generator.token_counter import TokenCounter
-from embedding_generator.utils import convert_decimal
+from .limit_estimator import TokenLimitEstimator
+from .token_counter import TokenCounter
+from .utils import convert_decimal
 
 
 class EmbeddingGenerator:
+    """A class for generating embeddings for a batch of texts using a SentenceTransformer model.
 
-    def __init__(self, model: SentenceTransformer, model_settings: dict, save_path: str = 'data') -> None:
-        """
-        Initializes the EmbeddingGenerator for managing and processing text embeddings with specified model settings.
+    The EmbeddingGenerator processes texts in batches to manage memory usage efficiently.
+    It chunks texts into manageable sizes based on token limits and processes them in parallel.
+    The embeddings are saved to disk along with the average embeddings for each text.
+
+    Attributes:
+        model: The SentenceTransformer model used for embedding generation.
+        model_settings: Configuration settings for the SentenceTransformer model.
+        save_path: Path where the embeddings will be saved.
+        max_memory_usage: Maximum allowable memory usage for self.texts.
+        limit_estimator: Instance of TokenLimitEstimator for managing token limits.
+        token_counter: Instance of TokenCounter for estimating token counts.
+        text_splitter: Instance for splitting texts into manageable chunks.
+        texts: Dictionary to hold current texts and their processing data.
+        text_generator: Iterator for input texts.
+        current_chunks: List of current chunks being processed.
+        progress_bar: TQDM progress bar for tracking progress.
+    """
+
+    def __init__(
+        self,
+        model: SentenceTransformer,
+        model_settings: dict,
+        save_path: str = "data",
+        max_memory_usage: int | None = None,
+    ) -> None:
+        """Initializes the EmbeddingGenerator for managing and processing text embeddings with specified model settings.
 
         Args:
             model: The SentenceTransformer model used for generating embeddings.
             model_settings: A dictionary of settings to configure the model during the embedding process.
-            save_path: The directory path where embeddings will be saved as a JSON file. Defaults to 'data'.
+            save_path: The directory path where embeddings will be saved. Defaults to 'data'.
+            max_memory_usage: Optional maximum memory usage in bytes for self.texts. If None, estimated dynamically.
 
         Attributes:
-            changed_keys (list[str]): List of keys that have been modified and need to be saved.
-            chunk_iterations (int): Counter for the number of chunk iterations.
-            knapsack_iterations (int): Counter for the number of knapsack iterations.
-            chunk_solution_attempts (int): Counter for the number of attempts to find a chunk solution.
-            computational_iterations (int): Counter for the number of computational iterations.
-            chunk_proposals (Optional[List[Dict]]): Proposals for chunking text to fit within token limits.
-            token_tolerance (int): Tolerance level for the difference between the token count and max tokens per batch.
-            model_settings (dict): Configuration settings for the SentenceTransformer model.
-            current_chunks (list[dict]): The current list of text chunks being processed for embedding.
-            model (SentenceTransformer): The SentenceTransformer model used for embedding generation.
-            max_tokens_per_batch (int): Maximum number of tokens allowed per batch.
-            current_total_tokens (int): The current total number of tokens being processed.
-            texts (Optional[dict]): A dictionary to hold the text and corresponding embeddings.
-            token_counter (TokenCounter): Instance of TokenCounter for estimating token counts.
-            text_splitter (RecursiveCharacterTextSplitter): Instance for splitting texts into manageable chunks.
-            save_path (Path): Path where the embeddings JSON file will be saved.
-            limit_model (TokenLimitEstimator): Instance of TokenLimitEstimator for managing token limits.
+            model: The SentenceTransformer model used for embedding generation.
+            model_settings: Configuration settings for the SentenceTransformer model.
+            save_path: Path where the embeddings will be saved.
+            max_memory_usage: Maximum allowable memory usage for self.texts.
+            limit_estimator: Instance of TokenLimitEstimator for managing token limits.
+            token_counter: Instance of TokenCounter for estimating token counts.
+            text_splitter: Instance for splitting texts into manageable chunks.
+            texts: Dictionary to hold current texts and their processing data.
+            text_generator: Iterator for input texts.
+            current_chunks: List of current chunks being processed.
+            progress_bar: TQDM progress bar for tracking progress.
         """
-        self.changed_keys: list[str] = []
-        self.chunk_iterations = 0
-        self.knapsack_iterations = 0
-        self.chunk_solution_attempts = 0
-        self.computational_iterations = 0
-        self.chunk_proposals = None
-        self.token_tolerance = 3000
-        self.model_settings = model_settings
-        self.current_chunks: list[dict] = []
         self.model = model
-        self.max_tokens_per_batch = self.model.max_seq_length * 10
-        self.current_total_tokens = 0
-        self.texts: dict = {}
+        self.model_settings = model_settings
+        self.save_path = Path(save_path)
+        self.save_path.mkdir(parents=True, exist_ok=True)
+        self.index_path = self.save_path / "embeddings_index.json"
+        self.data_path = self.save_path / "embeddings_data"
+        self.data_path.mkdir(parents=True, exist_ok=True)
+
+        self.limit_estimator = TokenLimitEstimator(initial_limit=model.max_seq_length * 10)
         self.token_counter = TokenCounter(self.model)
+        print(f"Original model max_seq_length: {self.model.max_seq_length}")
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.model.max_seq_length,
             chunk_overlap=20,
-            length_function=self.token_counter
+            length_function=self.token_counter,
         )
-        self.save_path = Path(save_path) / "embeddings.json"
-        self.limit_model = TokenLimitEstimator(self.max_tokens_per_batch)
+        self.texts = {}
+        self.text_generator: Iterator[str] = iter([])
+        self.current_chunks: list[dict] = []
+        self.progress_bar = None
+        self.max_memory_usage = max_memory_usage or self.estimate_max_memory_usage()
 
-
-    def __call__(self, texts: list[str]) -> dict[str, list[float] | None]:
-        """
-        Generates embeddings for a list of input texts, managing chunking, token limits, and saving progress.
+    def __call__(self, texts: Iterator[str]) -> dict[str, list[float] | None]:
+        """Processes embeddings in batches to manage memory usage.
 
         Args:
-            texts: A list of strings, each representing a text to be embedded.
+            texts: An iterator or generator of input texts.
 
         Returns:
-            A dictionary where each key is a text, and the value is another dictionary containing the finished average embedding for the chunks of that text
+            A dictionary where keys are texts, and values are their average embeddings.
         """
-        self.texts = {
-            text: {
-                'token_counts': [],
-                'embeddings': [],
-                'chunks': [],
-                'finished': [],
-                'average_embedding': None
-            } for text in texts if len(text) > 0}
+        self.text_generator = texts
+        self.load_index()
+        self.progress_bar = tqdm(desc="Generating Embeddings")
+
+        while True:
+            self.fill_texts()
+            if not self.texts:
+                break  # No more texts to process
+            self.process_current_texts()
+
+        # After processing all texts
+        return self.load_average_embeddings_with_fallback()
+
+    def fill_texts(self) -> None:
+        """Dynamically loads texts to fill embedding batches efficiently without exceeding memory limits."""
+        while self.needs_more_texts():
+            try:
+                text = next(self.text_generator)
+                text = text.strip()
+                if len(text) == 0:
+                    continue  # Skip empty texts
+                text_id = self.generate_text_id(text)
+                if (
+                        text_id in self.index_data
+                        and self.index_data[text_id]["status"] == "completed"
+                ):
+                    continue  # Skip already processed texts
+                self.estimate_tokens_in_text(text)
+                self.texts[text_id] = {
+                    "id": text_id,
+                    "text": text,
+                    "token_counts": [],
+                    "embeddings": [],
+                    "chunks": [],
+                    "finished": [],
+                    "average_embedding": None,
+                }
+                print(f"Added text: {text}, id: {text_id}")  # Debug statement
+                if self.current_memory_usage() > self.max_memory_usage:
+                    print("Max memory usage reached.")  # Debug statement
+                    break  # Prevent exceeding memory usage limit
+            except StopIteration:
+                break  # No more texts to fetch
+
+    def process_current_texts(self) -> None:
+        """Processes the current batch of texts in self.texts."""
         total_texts = len(self.texts)
+        self.progress_bar.total = total_texts
         self.load_data()
-        self.progress_bar = tqdm(total=total_texts, desc="Generating Embeddings", initial=total_texts - len(self.texts))
+
         while self.text_remains():
             if self.current_chunks:
                 self.embed()
-                if self.computational_iterations % 100 == 0:
-                    self.save_data()
-                completed_texts = self.get_completed_groups()
-                # If the progress bar is already initialized, update it
-                self.progress_bar.n = total_texts + len(completed_texts) - len(self.texts)
-                self.progress_bar.refresh()
+                self.save_data()
+                self.remove_completed_texts()
+            else:
+                self.set_chunks()
+
         self.save_data()
-        return self.load_average_embeddings_with_fallback(texts)
+        self.remove_completed_texts()
 
-    def embed(self) -> None:
-        """
-        Processes and embeds the current chunks of text. If an out-of-memory (OOM) error occurs,
-        the token limit is adjusted accordingly.
-
-        Raises:
-            RuntimeError: If an OOM error occurs, it adjusts the token limit based on the number of tokens
-                          in the current chunks and logs the failure.
-        """
-        try:
-            self.embed_chunks()
-            self.current_chunks = []
-            self.computational_iterations += 1
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                tokens = sum(chunk["length"] for chunk in self.current_chunks)
-                self.fail(tokens)
-
-    def text_remains(self) -> bool:
-        """
-        Checks if there are any unfinished texts that still need to be processed and sets up chunks for them.
+    def estimate_max_memory_usage(self) -> int:
+        """Estimates the maximum memory usage for self.texts based on available system memory.
 
         Returns:
-            A boolean indicating whether there are any texts remaining that require further processing.
+            Estimated maximum memory usage in bytes.
         """
-        unfinished_texts = [text for text, values in self.texts.items()
-                            if len(text) > 0 and (not values['finished'] or not all(values['finished']))]
-        if unfinished_texts:
-            self.set_chunks()
-            return True
-        return False
+        import psutil
+
+        total_memory = psutil.virtual_memory().total
+        max_usage = total_memory * 0.8  # Use up to 80% of total memory
+        return int(max_usage)
+
+    def needs_more_texts(self) -> bool:
+        """Determines if more texts are needed to fill batches.
+
+        Returns:
+            True if more texts are needed, False otherwise.
+        """
+        total_tokens_in_incomplete_chunks = self.estimate_total_tokens_in_incomplete_chunks()
+        tokens_needed = self.limit_estimator() - total_tokens_in_incomplete_chunks
+        return tokens_needed > 0
+
+    def current_memory_usage(self) -> int:
+        """Estimates current memory usage of self.texts.
+
+        Returns:
+            Estimated memory usage in bytes.
+        """
+        # Estimate based on number of texts and average size
+        average_text_size = self.estimate_average_text_size()
+        return len(self.texts) * average_text_size
+
+    def estimate_average_text_size(self) -> int:
+        """Estimates the average size in bytes of a text in self.texts.
+
+        Returns:
+            Average text size in bytes.
+        """
+        # Use a sample of texts to estimate
+        sample_texts = list(self.texts.keys())[:10]
+        if sample_texts:
+            average_size = sum(len(text.encode("utf-8")) for text in sample_texts) / len(
+                sample_texts
+            )
+        else:
+            average_size = 1000  # Default to 1KB if no data
+        return int(average_size)
+
+    def estimate_tokens_in_text(self, text: str) -> int:
+        """Estimates the number of tokens in a text using the TokenCounter.
+
+        Args:
+            text: The input text.
+
+        Returns:
+            Estimated number of tokens.
+        """
+        return self.token_counter(text)
+
+    def estimate_total_tokens_in_incomplete_chunks(self) -> int:
+        """Estimates the total number of tokens in incomplete chunks.
+
+        Returns:
+            Total tokens in incomplete chunks.
+        """
+        total_tokens = 0
+        for data in self.texts.values():
+            if "token_counts" in data and "finished" in data:
+                for count, finished in zip(data["token_counts"], data["finished"], strict=False):
+                    if not finished:
+                        total_tokens += count
+            else:
+                # If the text hasn't been chunked yet, estimate its token count
+                total_tokens += self.estimate_tokens_in_text("".join(data.get("chunks", [])) or "")
+        return total_tokens
+
+    def remove_completed_texts(self) -> None:
+        """Removes fully processed texts from self.texts to free up memory."""
+        keys_to_remove = []
+        for text_id, data in self.texts.items():
+            if data.get("average_embedding") is not None:
+                keys_to_remove.append(text_id)
+                self.progress_bar.update(1)
+                print(f"Removed completed text_id: {text_id}")  # Debug statement
+        for text_id in keys_to_remove:
+            del self.texts[text_id]
+
+    def text_remains(self) -> bool:
+        """Checks if there are any unfinished texts that still need to be processed and sets up chunks for them.
+
+        Returns:
+            True if there are texts remaining that require further processing, False otherwise.
+        """
+        unfinished_texts = [
+            text
+            for text, values in self.texts.items()
+            if (not values["finished"] or not all(values["finished"]))
+        ]
+        return bool(unfinished_texts)
 
     def set_chunks(self) -> None:
-        """
-        Determines the best chunks for processing based on the current token limits. If the chunk iterations
-        exceed the limit, assigns a single unfinished or unchunked text for processing.
-        """
-        self.chunk_iterations = 0
-        while self.find_best_chunks() and self.chunk_iterations < 5:
-            self.update_chunks()
-            self.chunk_iterations += 1
+        """Determines the best chunks for processing based on the current token limits."""
+        self.find_best_chunks()
 
-        # If we exceed the chunk iterations limit, assign a single unfinished or unchunked text
-        if self.chunk_iterations >= 5 and not self.current_chunks:
-            text = self.get_next_incomplete_or_unchunked_text()
-            if text:
-                # If the text hasn't been chunked yet, chunk it
-                if not self.texts[text]['chunks']:
-                    self.chunk_text(text)
-
-                # Assign the first available chunk to current_chunks
-                self.current_chunks = [{
-                    'length': self.texts[text]['token_counts'][0],
-                    'chunk': self.texts[text]['chunks'][0],
-                    'group_name': text
-                }]
+    def embed(self) -> None:
+        """Processes and embeds the current chunks of text. If an out-of-memory (OOM) error occurs, the token limit is adjusted accordingly."""
+        try:
+            self.embed_chunks()
+            tokens = sum(chunk["length"] for chunk in self.current_chunks)
+            self.succeed(tokens)
+            self.current_chunks = []
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                tokens = sum(chunk["length"] for chunk in self.current_chunks)
+                self.fail(tokens)
+                # Clear current chunks to prevent retrying the same failing batch
+                self.current_chunks = []
+                torch.cuda.empty_cache()
 
     def embed_chunks(self) -> None:
-        """
-        Embeds the current chunks of text using the model and updates the chunks with their respective embeddings.
-        Also handles cleanup by clearing GPU cache and removes finished chunks from the current processing list.
-        """
+        """Embeds the current chunks of text using the model and updates the chunks with their respective embeddings."""
         with torch.no_grad():
-            tensor = self.model.encode([chunk["chunk"] for chunk in self.current_chunks], **self.model_settings)
-            embeddings = tensor.detach().tolist()
+            tensor = self.model.encode(
+                [chunk["chunk"] for chunk in self.current_chunks], **self.model_settings
+            )
+            embeddings = tensor.detach().cpu().tolist()
             del tensor
             torch.cuda.empty_cache()
 
-        for embedding, chunk in zip(embeddings, self.current_chunks):
-            chunk['embedding'] = embedding
+        for embedding, chunk in zip(embeddings, self.current_chunks, strict=False):
+            chunk["embedding"] = embedding
 
         self.remove_finished_chunks()
-        tokens = sum(chunk["length"] for chunk in self.current_chunks)
-        self.succeed(tokens)
-
-    def fail(self, tokens: int) -> None:
-        """
-        Handles a failed embedding attempt by updating the token limit model based on the number of tokens
-        in the failed attempt and adjusts the maximum tokens per batch accordingly.
-
-        Args:
-            tokens: The number of tokens used in the failed embedding attempt.
-        """
-        self.limit_model.add_fail(tokens)
-        self.max_tokens_per_batch = self.limit_model()
 
     def succeed(self, tokens: int) -> None:
-        """
-        Handles a successful embedding attempt by updating the token limit model based on the number of tokens
-        used in the successful attempt and adjusts the maximum tokens per batch accordingly.
+        """Handles a successful embedding attempt by updating the token limit model.
 
         Args:
-            tokens: The number of tokens used in the successful embedding attempt.
+            tokens: The number of tokens used in the successful attempt.
         """
-        self.limit_model.add_success(tokens)
-        self.max_tokens_per_batch = self.limit_model()
+        self.limit_estimator.add_success(tokens)
 
-
-    def chunk_text(self, text: str) -> None:
-        """
-        Splits the given text into manageable chunks based on the model's token limits and initializes
-        the corresponding data structures for storing token counts, embeddings, and completion status.
+    def fail(self, tokens: int) -> None:
+        """Handles a failed embedding attempt by updating the token limit model.
 
         Args:
-            text: The input text to be chunked and processed for embeddings.
+            tokens: The number of tokens used in the failed attempt.
         """
-        chunks = self.chunker(text)
-        self.texts[text]['chunks'] = chunks
-        self.texts[text]['token_counts'] = self.get_token_counts(chunks)
-        self.texts[text]['embeddings'] = [None] * len(chunks)
-        self.texts[text]['finished'] = [False] * len(chunks)
-
-    def chunker(self, text: str) -> list[str]:
-        """
-        Splits the input text into smaller chunks that fit within the model's maximum sequence length.
-        If the text is shorter than the maximum length, it is returned as a single chunk.
-
-        Args:
-            text: The input text to be split into smaller chunks.
-
-        Returns:
-            A list of strings where each string is a chunk of the original text.
-        """
-        self.computational_iterations += 1
-        if self.count_tokens(text) < self.model.max_seq_length:
-            return [text]
-        return self.text_splitter.split_text(text)
-
-    def get_token_counts(self, chunks: list[str]) -> list[int]:
-        """
-        Calculates the token count for each chunk of text.
-
-        Args:
-            chunks: A list of text chunks for which token counts need to be calculated.
-
-        Returns:
-            A list of integers where each integer represents the token count for a corresponding chunk of text.
-        """
-        return [self.count_tokens(chunk) for chunk in chunks]
-
-    def count_tokens(self, chunk: str) -> int:
-        """
-        Counts the number of tokens in a given chunk of text using the TokenCounter.
-
-        Args:
-            chunk: A string representing a chunk of text for which the token count is needed.
-
-        Returns:
-            The number of tokens in the given chunk of text.
-        """
-        return self.token_counter(chunk)
+        self.limit_estimator.add_fail(tokens)
 
     def remove_finished_chunks(self) -> None:
-        """
-        Updates the embeddings and marks chunks as finished for all completed chunks in the current processing list.
-        It also updates the list of changed keys and recalculates the average embeddings for all groups.
-        """
-        self.changed_keys = []
+        """Updates the embeddings and marks chunks as finished for all completed chunks in the current processing list."""
         for info in self.current_chunks:
-            chunk = info['chunk']
-            group_name = info['group_name']
-            embedding = info['embedding']
+            chunk = info["chunk"]
+            text_id = info["group_name"]
+            embedding = info["embedding"]
+            chunk_index = info["chunk_index"]
 
-            if group_name in self.texts:
-                self.changed_keys.append(group_name)
-                group = self.texts[group_name]
-
-                # Find the index of the chunk in the group
-                if chunk in group['chunks']:
-                    index = group['chunks'].index(chunk)
-                    group['embeddings'][index] = embedding
-                    group['finished'][index] = True
+            print(f"Processing chunk {chunk_index} for text_id: {text_id}")  # Debug statement
+            if text_id in self.texts:
+                data = self.texts[text_id]
+                if 0 <= chunk_index < len(data["chunks"]):
+                    data["embeddings"][chunk_index] = embedding
+                    data["finished"][chunk_index] = True
+                    print(f"Marked chunk {chunk_index} as finished for text_id: {text_id}")  # Debug statement
+                else:
+                    print(f"Invalid chunk index {chunk_index} for text_id: {text_id}")  # Debug statement
+            else:
+                print(f"text_id {text_id} not found in self.texts")  # Debug statement
 
         self.calculate_all_average_embeddings()
 
-    def get_next_incomplete_or_unchunked_text(self) -> str | None:
-        """
-        Retrieves the next text that either has unfinished chunks or has not been chunked yet.
+    def find_best_chunks(self) -> None:
+        """Selects the best chunks to process using an efficient greedy approach with numpy."""
+        # Gather incomplete chunks
+        incomplete_chunks = []
+        for text_id, data in self.texts.items():
+            for idx, (length, chunk, finished) in enumerate(zip(
+                    data["token_counts"], data["chunks"], data["finished"], strict=False
+            )):
+                if not finished:
+                    incomplete_chunks.append({
+                        "length": length,
+                        "chunk": chunk,
+                        "text_id": text_id,
+                        "chunk_index": idx,
+                    })
+        print(f"Incomplete chunks: {incomplete_chunks}")  # Debug statement
 
-        Returns:
-            The text to be processed next, or None if all texts are already processed.
-        """
-        for text, data in self.texts.items():
-            # Check if the text is already chunked and has unfinished chunks
-            if data['chunks'] and not all(data['finished']):
-                return text
-            # Check if the text hasn't been chunked yet
-            if not data['chunks']:
-                return text
-        return None  # Return None if all texts are processed
+        # If no incomplete chunks, chunk all texts without chunks
+        if not incomplete_chunks:
+            for text_id, data in self.texts.items():
+                if not data["chunks"]:
+                    self.chunk_text(text_id)
+            # Update incomplete_chunks after chunking all necessary texts
+            incomplete_chunks = []
+            for text_id, data in self.texts.items():
+                for idx, (length, chunk, finished) in enumerate(zip(
+                        data["token_counts"], data["chunks"], data["finished"], strict=False
+                )):
+                    if not finished:
+                        incomplete_chunks.append({
+                            "length": length,
+                            "chunk": chunk,
+                            "text_id": text_id,
+                            "chunk_index": idx,
+                        })
+            print(f"Incomplete chunks after chunking: {incomplete_chunks}")  # Debug statement
 
+        # Proceed with processing incomplete_chunks as before
+        if not incomplete_chunks:
+            print("No chunks to process.")  # Debug statement
+            return  # No chunks to process
 
-    def get_incomplete_chunks(self) -> dict[str, dict[str, list]]:
-        """
-        Retrieves all incomplete chunks across all text groups.
+        # Extract arrays for sorting and selection
+        lengths = np.array([item['length'] for item in incomplete_chunks], dtype=np.int32)
+        chunks = np.array([item['chunk'] for item in incomplete_chunks])
+        group_names = np.array([item['text_id'] for item in incomplete_chunks])
+        chunk_indices = np.array([item['chunk_index'] for item in incomplete_chunks], dtype=np.int32)
 
-        Returns:
-            A dictionary where the key is the group name, and the value is another dictionary containing
-            the unfinished chunks, their token counts, embeddings, and their finished status.
-        """
-        incomplete_chunks = {}
-        for group_name, group_data in self.texts.items():
-            if 'chunks' in group_data and 'finished' in group_data:
-                unfinished_indices = [i for i, finished in enumerate(group_data['finished']) if not finished]
-                if unfinished_indices:
-                    incomplete_chunks[group_name] = {
-                        'chunks': [group_data['chunks'][i] for i in unfinished_indices],
-                        'token_counts': [group_data['token_counts'][i] for i in unfinished_indices] if 'token_counts' in group_data else [],
-                        'embeddings': [group_data['embeddings'][i] for i in unfinished_indices],
-                        'finished': [False] * len(unfinished_indices),
-                    }
-        return incomplete_chunks
+        # Sort indices by lengths in descending order
+        sorted_indices = np.argsort(-lengths)
+        sorted_lengths = lengths[sorted_indices]
+        sorted_chunks = chunks[sorted_indices]
+        sorted_group_names = group_names[sorted_indices]
+        sorted_chunk_indices = chunk_indices[sorted_indices]
 
-    def get_chunked_text(self) -> dict[str, dict[str, list]]:
-        """
-        Retrieves texts that have been chunked and still have incomplete chunks.
+        # Compute cumulative sum of token counts
+        cumulative_lengths = np.cumsum(sorted_lengths)
+        max_tokens_per_batch = self.limit_estimator()
+        # Find the indices where cumulative length is within the limit
+        within_limit = cumulative_lengths <= max_tokens_per_batch
 
-        Returns:
-            A dictionary where the key is the text, and the value is another dictionary containing
-            the chunks, token counts, embeddings, and their finished status for each chunk.
-        """
-        return {text: values for text, values in self.get_incomplete_chunks().items() if len(values.get('chunks', [])) > 0}
+        if not np.any(within_limit):
+            # No chunks can fit within the limit; process the largest available chunk
+            selected_indices = np.array([sorted_indices[0]])
+        else:
+            selected_indices = sorted_indices[within_limit]
 
-    def preprocess_items(self, items: list[tuple[int, str, str]], threshold: float = 0.01) -> list[tuple[int, str, str]]:
-        """
-        Filters out items that are too small to significantly impact the solution based on a threshold.
+        # Prepare the current chunks
+        self.current_chunks = [
+            {
+                "length": int(sorted_lengths[i]),
+                "chunk": sorted_chunks[i],
+                "group_name": sorted_group_names[i],
+                "chunk_index": int(sorted_chunk_indices[i]),
+            }
+            for i in selected_indices
+        ]
+        print(f"Selected current_chunks: {self.current_chunks}")  # Debug statement
 
-        Args:
-            items: A list of tuples, where each tuple contains the token count, the chunk, and the group name.
-            threshold: A float representing the minimum proportion of the max tokens per batch for an item to be retained. Defaults to 0.01.
-
-        Returns:
-            A list of tuples where each item has a token count greater than the calculated threshold.
-        """
-        # Calculate the threshold value based on the max tokens per batch
-        threshold_value = self.max_tokens_per_batch * threshold
-        return [item for item in items if item[0] > threshold_value]
-
-    def find_best_chunks(self, max_iterations: int = 1000) -> bool:
-        """
-        Finds the best chunks of text for embedding by maximizing token usage while staying within the token limit.
-
-        Args:
-            max_iterations: The maximum number of iterations for refining the chunk selection. Defaults to 1000.
-
-        Returns:
-            A boolean indicating whether a suitable set of chunks was found.
-        """
-        # Gather and preprocess text chunks
-        items = self.preprocess_items([
-            (length, chunk, group_name)
-            for group_name, group_data in self.get_chunked_text().items()
-            for length, chunk in zip(group_data['token_counts'], group_data['chunks'])
-        ])
-        if not items:
-            items = [
-                (length, chunk, group_name)
-                for group_name, group_data in self.get_chunked_text().items()
-                for length, chunk in zip(group_data['token_counts'], group_data['chunks'])
-            ]
-
-        if not items:
-            self.update_chunks()
-            return False  # No items to process
-
-        # Sort items by length in descending order for potentially better packing
-        items.sort(key=lambda x: x[0], reverse=True)
-        weights = np.array([item[0] for item in items], dtype=np.int32)
-        dp = np.zeros(self.max_tokens_per_batch + 1)
-
-        iteration_count = 0
-        for weight in weights:
-            if weight <= self.max_tokens_per_batch:
-                # Store the old dp array to detect changes
-                old_dp = dp.copy()
-                dp[weight:] = np.maximum(dp[weight:], dp[:-weight] + weight)
-                # Increment iteration_count and break if reached max_iterations
-                iteration_count += 1
-                if iteration_count >= max_iterations:
-                    break  # Stop updating after reaching max_iterations
-                # Early exit if there have been no changes
-                if np.array_equal(old_dp, dp):
-                    break  # Stop updating if no change is detected
-
-        # Check if the solution is within the acceptable tolerance
-        max_weight = np.max(dp)
-        if self.max_tokens_per_batch - max_weight < self.token_tolerance:
-            return self._process_solution(dp, items)
-
-        return self._process_solution(dp, items)
-
-    def greedy_solution(self, items: list[tuple[int, str, str]]) -> list[tuple[int, str, str]]:
-        """
-        Implements a greedy algorithm to select a set of chunks that maximizes token usage while staying
-        within the token limit for the current batch.
+    def chunk_text(self, text_id: str) -> None:
+        """Splits the given text into manageable chunks based on the model's token limits.
 
         Args:
-            items: A list of tuples where each tuple contains the token count, the chunk, and the group name.
-
-        Returns:
-            A list of tuples representing the selected chunks that fit within the token limit.
+            text_id: The unique identifier for the text to be chunked and processed for embeddings.
         """
-        current_total = 0
-        solution = []
-        for length, chunk, group_name in items:
-            if current_total + length <= self.max_tokens_per_batch:
-                solution.append((length, chunk, group_name))
-                current_total += length
-            if self.max_tokens_per_batch - current_total < self.token_tolerance:
-                break
-        return solution
-
-    def _process_solution(self, dp, items):
-        # Reconstruct the solution from the DP array
-        solution = []
-        j = np.argmax(dp)  # Start from the maximum value in the dp array
-        for weight, chunk, group_name in reversed(items):
-            if j >= weight and dp[j] == dp[j - weight] + weight:
-                solution.append((weight, chunk, group_name))
-                j -= weight
-
-        # Prepare the list of current chunks to be processed
-        self.current_chunks = [{
-            'length': length,
-            'chunk': chunk,
-            'group_name': group_name
-        } for length, chunk, group_name in solution]
-
-        if self.max_tokens_per_batch - sum(item[0] for item in solution) < self.token_tolerance:
-            self.chunk_solution_attempts = 0
-            return False  # Early stop if close to the tolerance limit
-        self.chunk_solution_attempts += 1
-        return True
-
-    def update_chunks(self) -> None:
-        """
-        Updates the list of chunks by checking if any text has not yet been chunked. If a text with no chunks
-        is found, it is chunked and added to the processing list.
-        """
-        for text, values in self.texts.items():
-            if len(values.get('chunks', [])) == 0:
-                self.chunk_text(text)
-                break
-
-    def get_completed_groups(self) -> dict[str, dict[str, list]]:
-        """
-        Retrieves all groups of text that have completed the embedding process, where all chunks are finished.
-
-        Returns:
-            A dictionary where the key is the group name, and the value is another dictionary containing
-            the group's data, including chunks, embeddings, and their finished status.
-        """
-        completed_groups = {}
-        for group_name, group_data in self.texts.items():
-            if len(group_data['chunks']) > 0:
-                if all(group_data['finished']):
-                    completed_groups[group_name] = group_data
-        return completed_groups
-
-    def calculate_average_embedding(self, group_name: str) -> None:
-        """
-        Calculates and assigns the weighted average embedding for a group of text chunks if all chunks
-        in the group are finished.
-
-        Args:
-            group_name: The name of the group for which the average embedding should be calculated.
-        """
-        group = self.texts[group_name]
-        if not all(group['finished']):
-            return  # Skip if not all embeddings are finished
-
-        embeddings = np.array(group['embeddings'])
-        token_counts = np.array(group['token_counts'])
-
-        # Calculate weighted average using NumPy
-        weighted_sum = np.dot(embeddings.T, token_counts)
-        total_tokens = token_counts.sum()
-        average_embedding = weighted_sum / total_tokens
-
-        # Assign the average embedding
-        group['average_embedding'] = average_embedding.tolist()
+        print(f"Chunking text_id: {text_id}")  # Debug statement
+        data = self.texts[text_id]
+        text = data["text"]
+        chunks = self.text_splitter.split_text(text)
+        print(f"Chunks for text_id {text_id}: {chunks}")  # Debug statement
+        token_counts = [self.token_counter(chunk) for chunk in chunks]
+        print(f"Token counts for text_id {text_id}: {token_counts}")  # Debug statement
+        data["chunks"] = chunks
+        data["token_counts"] = token_counts
+        data["embeddings"] = [None] * len(chunks)
+        data["finished"] = [False] * len(chunks)
 
     def calculate_all_average_embeddings(self) -> None:
+        """Calculates and assigns the weighted average embedding for all groups of text chunks that have completed the embedding process.
+
+        The average embedding is calculated based on the weighted sum of embeddings and token counts.
         """
-        Calculates and assigns the weighted average embedding for all groups of text chunks
-        that have completed the embedding process.
-        """
-        completed_groups = self.get_completed_groups()
-        for group_name in completed_groups:
-            self.calculate_average_embedding(group_name)
-
-
-    def save_data(self) -> None:
-        """
-        Incrementally saves the embedding data to a JSON file, ensuring that large files are handled efficiently.
-        The method writes to a temporary file and then renames it to avoid data corruption.
-
-        Updates:
-            - Converts Decimal types to floats.
-            - For complete entries, only saves the average embedding.
-            - Writes the key-value pairs to a temporary file, handling updates for changed keys.
-            - Renames the temporary file to the original file after writing.
-            - Removes completed entries from self.texts after saving.
-        """
-        file_path = self.save_path
-        temp_path = file_path.with_suffix('.tmp')
-        keys_to_remove = set()
-
-        with file_path.open('rb') as f, open(temp_path, 'wb') as temp_file:
-            # Write opening bracket for JSON object
-            temp_file.write(b'{\n')
-
-            # Read the existing JSON file incrementally
-            parser = ijson.kvitems(f, '')
-            first_entry = True  # To handle commas between JSON objects
-
-            for text, content in parser:
-                # Convert Decimal types to floats
-                content = convert_decimal(content)
-
-                # Handle finished entries that only have the average_embedding
-                if content.get('average_embedding') and len(content) == 1:
-                    # This entry is considered complete
-                    keys_to_remove.add(text)
-
-                if text in self.changed_keys:
-                    new_content = self.texts[text]
-
-                    # Update content if changes are detected
-                    if 'finished' in new_content and all(new_content['finished']) and len(new_content['finished']) > 0:
-                        keys_to_remove.add(text)
-                        new_content = {
-                            'average_embedding': new_content['average_embedding']
-                        }
-
-                    content = new_content
-                    self.changed_keys.remove(text)
-
-                # Write the key-value pair to the temp file
-                if not first_entry:
-                    temp_file.write(b',\n')
-                json_bytes = orjson.dumps({text: content})
-                temp_file.write(json_bytes[1:-1])  # Strip the outer braces
-                first_entry = False
-
-            # Write closing bracket for JSON object
-            temp_file.write(b'\n}')
-
-        # Rename the temporary file to the original file
-        shutil.move(temp_path, self.save_path)
-
-        # Remove completed entries from self.texts
-        for key in keys_to_remove:
-            del self.texts[key]
+        for data in self.texts.values():
+            if data["average_embedding"] is None and all(data["finished"]):
+                embeddings = np.array(data["embeddings"], dtype=np.float32)
+                token_counts = np.array(data["token_counts"], dtype=np.float32)
+                # Calculate weighted average
+                weighted_embeddings = embeddings * token_counts[:, np.newaxis]
+                total_tokens = token_counts.sum()
+                average_embedding = weighted_embeddings.sum(axis=0) / total_tokens
+                data["average_embedding"] = average_embedding.tolist()
 
     def load_data(self) -> None:
-        """
-        Loads existing embedding data from a JSON file, updating the internal state with the loaded data.
-        Completed texts that do not require further processing are skipped.
+        """Loads data for texts currently in self.texts."""
+        for text_id, data in self.texts.items():
+            data_file = self.data_path / f"{text_id}.json"
+            if data_file.exists():
+                with data_file.open("rb") as f:
+                    content = orjson.loads(f.read())
+                    content = convert_decimal(content)
+                    data.update(content)
 
-        Updates:
-            - Ensures embeddings are lists of floats by converting Decimal types.
-            - Merges loaded data with the existing internal state, updating token counts, embeddings, chunks,
-              finished status, and average embeddings.
-        """
-        file_path = self.save_path
+    def save_data(self) -> None:
+        """Saves embeddings data per text to individual files and updates the index."""
+        for text_id, data in self.texts.items():
+            data_to_save = {
+                "token_counts": data["token_counts"],
+                "embeddings": data["embeddings"],
+                "chunks": data["chunks"],
+                "finished": data["finished"],
+                "average_embedding": data["average_embedding"],
+            }
+            data_file = self.data_path / f"{text_id}.json"
+            # Save data to individual file
+            with data_file.open("wb") as f:
+                json_bytes = orjson.dumps(data_to_save)
+                f.write(json_bytes)
+            # Update index
+            self.index_data[text_id] = {
+                "status": "completed" if data.get("average_embedding") else "in_progress",
+                "text": data["text"],
+            }
+        # Save the updated index
+        with self.index_path.open("wb") as f:
+            json_bytes = orjson.dumps(self.index_data)
+            f.write(json_bytes)
 
-        if file_path.exists():
-            try:
-                with file_path.open('rb') as f:
-                    parser = ijson.kvitems(f, '')
+    def load_index(self) -> None:
+        """Loads the embeddings index from disk."""
+        self.index_data = {}
+        if self.index_path.exists():
+            with self.index_path.open("rb") as f:
+                self.index_data = orjson.loads(f.read())
 
-                    for text, content in parser:
-                        # Check if all 'finished' values are True
-                        if ('finished' in content and all(content['finished']) and len(content['finished']) > 0) or (list(content.keys()) == ['average_embedding']):
-                            # Skip loading this text as it is already completed
-                            del self.texts[text]
-                            continue
-
-                        # Ensure embeddings are lists of floats
-                        content = convert_decimal(content)
-
-                        # Update or add entries to self.texts
-                        if text in self.texts:
-                            self.texts[text].update({
-                                'token_counts': content.get('token_counts', []),
-                                'embeddings': content.get('embeddings', []),
-                                'chunks': content.get('chunks', []),
-                                'finished': content.get('finished', []),
-                                'average_embedding': content.get('average_embedding', None)
-                            })
-                        else:
-                            self.texts[text] = {
-                                'token_counts': content.get('token_counts', []),
-                                'embeddings': content.get('embeddings', []),
-                                'chunks': content.get('chunks', []),
-                                'finished': content.get('finished', []),
-                                'average_embedding': content.get('average_embedding', None)
-                            }
-            except Exception as e:
-                print(f'Error processing JSON file: {e}')
-
-    def load_average_embeddings_with_fallback(self, texts: list[str]) -> dict[str, list[float] | None]:
-        """
-        Loads only the average embeddings for each text key from the saved file. If an embedding is missing,
-        it sets the value to None.
+    def generate_text_id(self, text: str) -> str:
+        """Generates a unique identifier for a text.
 
         Args:
-            texts: A list of text keys for which the average embeddings are needed.
+            text: The input text.
 
         Returns:
-            A dictionary where the key is the text identifier, and the value is the average embedding (a list of floats)
-            or None if the embedding is missing.
+            A unique identifier string for the text.
         """
-        average_embeddings = {text: None for text in texts}
-        file_path = self.save_path
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-        if file_path.exists():
-            try:
-                with file_path.open('rb') as f:
-                    parser = ijson.kvitems(f, '')
+    def load_average_embeddings_with_fallback(self) -> dict[str, list[float] | None]:
+        """Loads only the average embeddings for each text key from the index.
 
-                    for text, content in parser:
-                        if text in average_embeddings and 'average_embedding' in content and content[
-                            'average_embedding']:
-                            average_embeddings[text] = content['average_embedding']
-
-            except Exception as e:
-                print(f'Error processing JSON file: {e}')
-
+        Returns:
+            A dictionary where the key is the text, and the value is the average embedding or None.
+        """
+        average_embeddings = {}
+        self.load_index()
+        for text_id, entry in self.index_data.items():
+            if entry["status"] == "completed":
+                data_file = self.data_path / f"{text_id}.json"
+                if data_file.exists():
+                    with data_file.open("rb") as f:
+                        data = orjson.loads(f.read())
+                        average_embeddings[entry["text"]] = data.get("average_embedding")
+                else:
+                    average_embeddings[entry["text"]] = None
+            else:
+                average_embeddings[entry["text"]] = None
         return average_embeddings
