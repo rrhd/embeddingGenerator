@@ -5,10 +5,10 @@ import json
 from pathlib import Path
 
 import click
-from pygments.lexer import default
+from sentence_transformers import SentenceTransformer
 
 from embedding_generator.generator import EmbeddingGenerator
-from sentence_transformers import SentenceTransformer
+
 
 def load_texts_from_file(file_path: Path) -> list[str]:
     """Load texts from a file based on its extension."""
